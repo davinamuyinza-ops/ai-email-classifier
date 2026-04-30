@@ -24,42 +24,100 @@ def check_moderation(text: str) -> bool:
 
     return result.results[0].flagged
 
-def ask_ai(subject: str, body: str):
+
+def classify_step(subject: str, body: str):
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {"role": "system", "content": """
+Classify the email into exactly ONE category:
+
+refund, complaint, appointment_request, general_inquiry
+
+Return ONLY the category name.
+No explanations.
+"""},
+            {"role": "user", "content": f"Subject: {subject}\nBody: {body}"}
+        ]
+    )
+    return response.output_text.strip().lower()
+
+def priority_step(subject: str, body: str):
     response = client.responses.create(
         model="gpt-4.1-mini",
         input=[
             {
                 "role": "system",
                 "content": """
-You are a strict email classification system.
+Determine the priority of the email.
 
-Allowed categories:
-refund, complaint, appointment_request, general_inquiry
+Return ONLY one of:
+low, medium, high
 
-Return ONLY valid JSON in this format:
-{
-  "category": "",
-  "priority": "low | medium | high",
-  "entities": {},
-  "suggested_reply": ""
-}
-
-Rules:
-- category must be EXACTLY one of the allowed values
-- do not invent new categories
-- do not explain anything
-- do not return text outside JSON
-- entities must only include keys that appear in the email
+No explanation.
 """
             },
             {
                 "role": "user",
                 "content": f"Subject: {subject}\nBody: {body}"
             }
+        ]
+    )
+    return response.output_text.strip().lower()
+
+def extract_entities_step(subject: str, body: str):
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+           {"role": "system", "content": """
+Extract entities from the email.
+
+Allowed keys:
+name, email, phone, order_id, date, time
+
+Return ONLY valid JSON.
+Include only keys that exist in the email.
+"""},
+            {"role": "user", "content": f"Subject: {subject}\nBody: {body}"}
         ],
         text={"format": {"type": "json_object"}}
     )
+    return json.loads(response.output_text)
 
+def decision_summary_step(category: str, subject: str, body: str):
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {
+                "role": "system",
+                "content": """
+Write ONE short sentence explaining the classification.
+
+Do not include reasoning steps.
+Be concise.
+"""
+            },
+            {
+                "role": "user",
+                "content": f"Category: {category}\nSubject: {subject}\nBody: {body}"
+            }
+        ]
+    )
+    return response.output_text.strip()
+
+def reply_step(category: str, subject: str, body: str):
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {"role": "system", "content": """
+Generate a short, professional, helpful reply.
+
+Do not be long.
+Be polite and clear.
+"""},
+            {"role": "user", "content": f"Category: {category}\nSubject: {subject}\nBody: {body}"}
+        ]
+    )
     return response.output_text
 
 
@@ -69,19 +127,35 @@ def classify_email(payload: EmailIn):
 
     full_text = f"Subject: {payload.subject}\nBody: {payload.body}"
 
-    flagged = check_moderation(full_text)
-
-    if flagged:
+    if check_moderation(full_text):
         return {"error": "Content violates safety policies."}
 
-    ai_result = ask_ai(payload.subject, payload.body)
+    category = classify_step(payload.subject, payload.body)
+    priority = priority_step(payload.subject, payload.body)
+    entities = extract_entities_step(payload.subject, payload.body)
+    summary = decision_summary_step(category, payload.subject, payload.body)
+    reply = reply_step(category, payload.subject, payload.body)
 
-    try:
-        parsed = json.loads(ai_result)
-    except Exception:
-        return {"error": "Invalid AI response", "raw": ai_result}
+    # Output checking
+    allowed_categories = ["refund", "complaint", "appointment_request", "general_inquiry"]
+    allowed_priorities = ["low", "medium", "high"]
 
-    return parsed
+    if category not in allowed_categories:
+        return {"error": "Invalid category", "value": category}
+
+    if priority not in allowed_priorities:
+        return {"error": "Invalid priority", "value": priority}
+
+    if not isinstance(entities, dict):
+        return {"error": "Entities must be a dictionary"}
+
+    return {
+        "category": category,
+        "priority": priority,
+        "entities": entities,
+        "decision_summary": summary,
+        "suggested_reply": reply
+    }
 
 @app.get("/health")
 def health():
