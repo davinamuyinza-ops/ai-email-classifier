@@ -34,101 +34,63 @@ def check_moderation(text: str) -> bool:
     return result.results[0].flagged
 
 
-def classify_step(subject: str, body: str):
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {"role": "system", "content": """
-Classify the email into exactly ONE category:
-
-refund, complaint, appointment_request, general_inquiry
-
-Return ONLY the category name.
-No explanations.
-"""},
-            {"role": "user", "content": f"Subject: {subject}\nBody: {body}"}
-        ]
-    )
-    return response.output_text.strip().lower()
-
-def priority_step(subject: str, body: str):
+def analyze_email(subject: str, body: str) -> dict:
     response = client.responses.create(
         model="gpt-4.1-mini",
         input=[
             {
                 "role": "system",
                 "content": """
-Determine the priority of the email.
+You are an AI Email Operations Assistant for businesses.
 
-Return ONLY one of:
-low, medium, high
+Analyze the email and return ONLY valid JSON in this format:
 
-No explanation.
+{
+  "categories": [],
+  "priority": "low | medium | high",
+  "sentiment": "neutral | frustrated | angry | positive",
+  "entities": {},
+  "route_to": [],
+  "actions": [],
+  "confidence": 0.0,
+  "requires_human_review": false,
+  "decision_summary": "",
+  "suggested_reply": ""
+}
+
+Allowed categories:
+refund, complaint, appointment_request, general_inquiry
+
+Allowed entity keys:
+name, email, phone, order_id, date, time, company, product
+
+Allowed route_to values:
+support, billing, scheduling, sales, general_support
+
+Rules:
+- categories must be a list.
+- Include all clearly present categories.
+- Use only allowed categories.
+- If no specific category fits, use ["general_inquiry"].
+- entities must include only keys found in the email.
+- actions must be clear business next steps.
+- confidence must be a number between 0 and 1.
+- requires_human_review must be true if the email is angry, unclear, high priority, or contains multiple categories.
+- decision_summary must be one short sentence.
+- suggested_reply must address all categories in one professional reply.
+- Return no text outside JSON.
 """
             },
             {
                 "role": "user",
                 "content": f"Subject: {subject}\nBody: {body}"
             }
-        ]
-    )
-    return response.output_text.strip().lower()
-
-def extract_entities_step(subject: str, body: str):
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-           {"role": "system", "content": """
-Extract entities from the email.
-
-Allowed keys:
-name, email, phone, order_id, date, time
-
-Return ONLY valid JSON.
-Include only keys that exist in the email.
-"""},
-            {"role": "user", "content": f"Subject: {subject}\nBody: {body}"}
         ],
-        text={"format": {"type": "json_object"}}
+        text={"format": {"type": "json_object"}},
+        temperature=0
     )
+
     return json.loads(response.output_text)
-
-def decision_summary_step(category: str, subject: str, body: str):
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {
-                "role": "system",
-                "content": """
-Write ONE short sentence explaining the classification.
-
-Do not include reasoning steps.
-Be concise.
-"""
-            },
-            {
-                "role": "user",
-                "content": f"Category: {category}\nSubject: {subject}\nBody: {body}"
-            }
-        ]
-    )
-    return response.output_text.strip()
-
-def reply_step(category: str, subject: str, body: str):
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {"role": "system", "content": """
-Generate a short, professional, helpful reply.
-
-Do not be long.
-Be polite and clear.
-"""},
-            {"role": "user", "content": f"Category: {category}\nSubject: {subject}\nBody: {body}"}
-        ]
-    )
-    return response.output_text
-
 
 
 @app.post("/classify-email")
@@ -139,32 +101,46 @@ def classify_email(payload: EmailIn):
     if check_moderation(full_text):
         return {"error": "Content violates safety policies."}
 
-    category = classify_step(payload.subject, payload.body)
-    priority = priority_step(payload.subject, payload.body)
-    entities = extract_entities_step(payload.subject, payload.body)
-    summary = decision_summary_step(category, payload.subject, payload.body)
-    reply = reply_step(category, payload.subject, payload.body)
+    result = analyze_email(payload.subject, payload.body)
 
-    # Output checking
     allowed_categories = ["refund", "complaint", "appointment_request", "general_inquiry"]
     allowed_priorities = ["low", "medium", "high"]
+    allowed_sentiments = ["neutral", "frustrated", "angry", "positive"]
+    allowed_routes = ["support", "billing", "scheduling", "sales", "general_support"]
 
-    if category not in allowed_categories:
-        return {"error": "Invalid category", "value": category}
+    if not isinstance(result.get("categories"), list):
+        return {"error": "categories must be a list"}
 
-    if priority not in allowed_priorities:
-        return {"error": "Invalid priority", "value": priority}
+    for category in result["categories"]:
+        if category not in allowed_categories:
+            return {"error": "Invalid category", "value": category}
 
-    if not isinstance(entities, dict):
-        return {"error": "Entities must be a dictionary"}
+    if result.get("priority") not in allowed_priorities:
+        return {"error": "Invalid priority", "value": result.get("priority")}
 
-    return {
-        "category": category,
-        "priority": priority,
-        "entities": entities,
-        "decision_summary": summary,
-        "suggested_reply": reply
-    }
+    if result.get("sentiment") not in allowed_sentiments:
+        return {"error": "Invalid sentiment", "value": result.get("sentiment")}
+
+    if not isinstance(result.get("entities"), dict):
+        return {"error": "entities must be a dictionary"}
+
+    if not isinstance(result.get("route_to"), list):
+        return {"error": "route_to must be a list"}
+
+    for route in result["route_to"]:
+        if route not in allowed_routes:
+            return {"error": "Invalid route", "value": route}
+
+    if not isinstance(result.get("actions"), list):
+        return {"error": "actions must be a list"}
+
+    if not isinstance(result.get("confidence"), (int, float)):
+        return {"error": "confidence must be a number"}
+
+    if not isinstance(result.get("requires_human_review"), bool):
+        return {"error": "requires_human_review must be true or false"}
+
+    return result
 
 @app.get("/health")
 def health():
